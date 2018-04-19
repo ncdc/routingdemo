@@ -84,6 +84,12 @@
   version = "1.1.3"
 
 [[projects]]
+  name = "github.com/miekg/dns"
+  packages = ["."]
+  revision = "83c435cc65d2862736428b9b4d07d0ab10ad3e4d"
+  version = "v1.0.5"
+
+[[projects]]
   name = "github.com/modern-go/concurrent"
   packages = ["."]
   revision = "bacd9c7ef1dd9b15be4a9909b8ac7a4e313eec94"
@@ -104,18 +110,27 @@
 [[projects]]
   branch = "master"
   name = "golang.org/x/crypto"
-  packages = ["ssh/terminal"]
+  packages = [
+    "ed25519",
+    "ed25519/internal/edwards25519",
+    "ssh/terminal"
+  ]
   revision = "d6449816ce06963d9d136eee5a56fca5b0616e7e"
 
 [[projects]]
   branch = "master"
   name = "golang.org/x/net"
   packages = [
+    "bpf",
     "context",
     "http/httpguts",
     "http2",
     "http2/hpack",
     "idna",
+    "internal/iana",
+    "internal/socket",
+    "ipv4",
+    "ipv6",
     "lex/httplex"
   ]
   revision = "d41e8174641f662c5a2d1c7a5f9e828788eb8706"
@@ -373,7 +388,8 @@
     "util/flowcontrol",
     "util/homedir",
     "util/integer",
-    "util/retry"
+    "util/retry",
+    "util/workqueue"
   ]
   revision = "989be4278f353e42f26c416c53757d16fcff77db"
   version = "kubernetes-1.10.1"
@@ -381,6 +397,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "036579d68fc4a30688ffb5996f7e89a130535ad7d080a0e2d00e4290ff4fd23d"
+  inputs-digest = "00ce1c9b431b68ad5acf8afaae6ac932965df8900d3a72b1aedfa364af37ecf7"
   solver-name = "gps-cdcl"
   solver-version = 1

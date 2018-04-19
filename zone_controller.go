@@ -34,16 +34,20 @@ type zoneController struct {
 	*genericController
 
 	configMapsClient coreclient.ConfigMapsGetter
+
+	backends chan<- []*backend
 }
 
 func newZoneController(
 	configMapsClient coreclient.ConfigMapsGetter,
 	configMapsInformer coreinformers.ConfigMapInformer,
+	backends chan<- []*backend,
 ) *zoneController {
 	c := &zoneController{
 		genericController: newGenericController("zone"),
 
 		configMapsClient: configMapsClient,
+		backends:         backends,
 	}
 
 	c.syncHandler = c.rebuildZone
@@ -60,6 +64,14 @@ func newZoneController(
 }
 
 func (c *zoneController) rebuildZone(key string) error {
+	ns, _, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		c.log("error splitting %s: %v", key, err)
+		return nil
+	}
+	if ns != "routing" {
+		return nil
+	}
 	/*
 			x := `backend.            IN      SOA     ns.backend. andy.heptio.com. 2015082541 7200 3600 1209600 3600
 		backend.            IN      NS      ns
@@ -72,7 +84,7 @@ func (c *zoneController) rebuildZone(key string) error {
 	log.Println("getting coredns-zones configmap")
 	zonesCM, err := c.configMapsClient.ConfigMaps("kube-system").Get("coredns-zones", metav1.GetOptions{})
 	if err != nil {
-		log.Printf("error getting coredns-zones configmap: %v\n", err)
+		c.log("error getting coredns-zones configmap: %v", err)
 		return err
 	}
 
@@ -81,7 +93,7 @@ func (c *zoneController) rebuildZone(key string) error {
 	log.Println("parsing zone")
 	token := <-dns.ParseZone(strings.NewReader(zone), "", "")
 	if token.Error != nil {
-		log.Printf("error parsing zone: %v\n", err)
+		c.log("error parsing zone: %v", err)
 		return token.Error
 	}
 
@@ -98,12 +110,14 @@ func (c *zoneController) rebuildZone(key string) error {
 	log.Println("getting backend configmaps")
 	list, err := c.configMapsClient.ConfigMaps(routingNamespace).List(metav1.ListOptions{})
 	if err != nil {
-		log.Printf("error listing backend configmaps: %v\n", err)
+		c.log("error listing backend configmaps: %v", err)
 		return err
 	}
 
+	var backends []*backend
+
 	for _, be := range list.Items {
-		log.Printf("adding %s=%s\n", be.Name, be.Data["ip"])
+		c.log("adding %s=%s", be.Name, be.Data["ip"])
 		a := dns.A{
 			Hdr: dns.RR_Header{
 				Name:   fmt.Sprintf("*.%s.backend.", be.Name),
@@ -114,6 +128,8 @@ func (c *zoneController) rebuildZone(key string) error {
 		}
 
 		zone += a.String() + "\n"
+
+		backends = append(backends, &backend{name: be.Name, ip: be.Data["ip"], kubeconfig: be.Data["kubeconfig"]})
 	}
 
 	zonesCM.Data["db.backend"] = zone
@@ -123,9 +139,12 @@ func (c *zoneController) rebuildZone(key string) error {
 
 	_, err = c.configMapsClient.ConfigMaps("kube-system").Update(zonesCM)
 	if err != nil {
-		log.Printf("error updating coredns-zones configmap: %v\n", err)
+		c.log("error updating coredns-zones configmap: %v", err)
 		return err
 	}
+
+	log.Println("sending to backends channel")
+	c.backends <- backends
 
 	return nil
 }

@@ -38,6 +38,7 @@ type genericController struct {
 	resyncPeriod         time.Duration
 	cacheSyncWaiters     []cache.InformerSynced
 	additionalGoroutines []func(done <-chan struct{})
+	stopHandler          func()
 }
 
 func newGenericController(name string) *genericController {
@@ -47,6 +48,10 @@ func newGenericController(name string) *genericController {
 	}
 
 	return c
+}
+
+func (c *genericController) log(msg string, args ...interface{}) {
+	log.Printf("["+c.name+"] "+msg+"\n", args...)
 }
 
 // Run is a blocking function that runs the specified number of worker goroutines
@@ -61,7 +66,7 @@ func (c *genericController) Run(ctx context.Context, numWorkers int) error {
 	var wg sync.WaitGroup
 
 	defer func() {
-		log.Println("Waiting for workers to finish their work")
+		c.log("Waiting for workers to finish their work")
 
 		c.queue.ShutDown()
 
@@ -70,18 +75,18 @@ func (c *genericController) Run(ctx context.Context, numWorkers int) error {
 		// we want to shut down the queue via defer and not at the end of the body.
 		wg.Wait()
 
-		log.Println("All workers have finished")
+		c.log("All workers have finished")
 
 	}()
 
-	log.Println("Starting controller")
-	defer log.Println("Shutting down controller")
+	c.log("Starting controller")
+	defer c.log("Shutting down controller")
 
-	log.Println("Waiting for caches to sync")
+	c.log("Waiting for caches to sync")
 	if !cache.WaitForCacheSync(ctx.Done(), c.cacheSyncWaiters...) {
 		return errors.New("timed out waiting for caches to sync")
 	}
-	log.Println("Caches are synced")
+	c.log("Caches are synced")
 
 	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
@@ -110,6 +115,12 @@ func (c *genericController) Run(ctx context.Context, numWorkers int) error {
 
 	<-ctx.Done()
 
+	if c.stopHandler != nil {
+		c.log("invoking stop handler")
+		c.stopHandler()
+		c.log("done invoking stop handler")
+	}
+
 	return nil
 }
 
@@ -137,7 +148,7 @@ func (c *genericController) processNextWorkItem() bool {
 		return true
 	}
 
-	log.Printf("Error in syncHandler for %v, re-adding item to queue: %v\n", key, err)
+	c.log("Error in syncHandler for %v, re-adding item to queue: %v", key, err)
 	// we had an error processing the item so add it back
 	// into the queue for re-processing with rate-limiting
 	c.queue.AddRateLimited(key)
@@ -148,7 +159,7 @@ func (c *genericController) processNextWorkItem() bool {
 func (c *genericController) enqueue(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
-		log.Printf("Error creating queue key, item not added to queue: %v\n", err)
+		c.log("Error creating queue key, item not added to queue: %v", err)
 		return
 	}
 

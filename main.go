@@ -22,7 +22,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"sync"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -38,6 +37,7 @@ import (
 const routingNamespace = "routing"
 
 var routerKubeconfig string
+var namespace string
 
 func main() {
 	app := cli.NewApp()
@@ -47,8 +47,17 @@ func main() {
 			Name:        "kubeconfig",
 			Destination: &routerKubeconfig,
 		},
+		cli.StringFlag{
+			Name:        "namespace, n",
+			Destination: &namespace,
+		},
 	}
-
+	app.Before = func(c *cli.Context) error {
+		if namespace == "" {
+			namespace = routingNamespace
+		}
+		return nil
+	}
 	app.Commands = []cli.Command{
 		{
 			Name:   "add-backend",
@@ -164,15 +173,14 @@ func addVhost(c *cli.Context) error {
 	}
 
 	vhost := c.Args().Get(0)
-	selector := c.Args().Get(1)
+	//selector := c.Args().Get(1)
 
 	ingress := v1beta1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: routingNamespace,
-			Name:      vhost,
-			Annotations: map[string]string{
-				"routing.selector": selector,
-			},
+			Name: vhost,
+			// Annotations: map[string]string{
+			// 	"routing.selector": selector,
+			// },
 		},
 		Spec: v1beta1.IngressSpec{
 			Rules: []v1beta1.IngressRule{
@@ -196,22 +204,29 @@ func addVhost(c *cli.Context) error {
 		},
 	}
 
-	if _, err := client.ExtensionsV1beta1().Ingresses(routingNamespace).Create(&ingress); err != nil {
+	if _, err := client.ExtensionsV1beta1().Ingresses(namespace).Create(&ingress); err != nil {
 		return err
 	}
 
 	service := v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: routingNamespace,
-			Name:      vhost,
+			Name: vhost,
 		},
 		Spec: v1.ServiceSpec{
 			Type:      v1.ServiceTypeClusterIP,
 			ClusterIP: "None",
+			Ports: []v1.ServicePort{
+				{
+					Name:       "http",
+					Protocol:   "TCP",
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
 		},
 	}
 
-	if _, err := client.CoreV1().Services(routingNamespace).Create(&service); err != nil {
+	if _, err := client.CoreV1().Services(namespace).Create(&service); err != nil {
 		return err
 	}
 
@@ -226,11 +241,11 @@ func deleteVhost(c *cli.Context) error {
 
 	vhost := c.Args().Get(0)
 
-	if err := client.ExtensionsV1beta1().Ingresses(routingNamespace).Delete(vhost, nil); err != nil {
+	if err := client.ExtensionsV1beta1().Ingresses(namespace).Delete(vhost, nil); err != nil {
 		return err
 	}
 
-	if err := client.CoreV1().Services(routingNamespace).Delete(vhost, nil); err != nil {
+	if err := client.CoreV1().Services(namespace).Delete(vhost, nil); err != nil {
 		return err
 	}
 
@@ -243,22 +258,20 @@ func listVhosts(c *cli.Context) error {
 		return err
 	}
 
-	list, err := client.ExtensionsV1beta1().Ingresses(routingNamespace).List(metav1.ListOptions{})
+	list, err := client.ExtensionsV1beta1().Ingresses(namespace).List(metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 
 	for _, vhost := range list.Items {
-		fmt.Printf("%s: %s\n", vhost.Name, vhost.Annotations["routing.selector"])
+		fmt.Printf("%s\n", vhost.Name)
 	}
 
 	return nil
 }
 
 func runServer(c *cli.Context) error {
-	s := &server{
-		backendControllers: make(map[string]*backendController),
-	}
+	s := &server{}
 
 	s.run()
 
@@ -267,13 +280,9 @@ func runServer(c *cli.Context) error {
 
 type server struct {
 	client kubernetes.Interface
-
-	backendControllersLock sync.Mutex
-	backendControllers     map[string]*backendController
 }
 
 func (s *server) run() error {
-	// list/watch ConfigMaps in routing ns
 	client, err := getClient(routerKubeconfig)
 	if err != nil {
 		return err
@@ -281,12 +290,24 @@ func (s *server) run() error {
 	s.client = client
 
 	log.Println("creating shared informer factory")
-	sharedInfomers := informers.NewFilteredSharedInformerFactory(client, 0, routingNamespace, nil)
+	sharedInfomers := informers.NewSharedInformerFactory(client, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	zoneController := newZoneController(client.CoreV1(), sharedInfomers.Core().V1().ConfigMaps())
+	backends := make(chan []*backend, 1)
+
+	zoneController := newZoneController(
+		client.CoreV1(),
+		sharedInfomers.Core().V1().ConfigMaps(),
+		backends,
+	)
+
+	backendControllerManager := newBackendControllerManager(
+		backends,
+		client.CoreV1(),
+		sharedInfomers.Extensions().V1beta1().Ingresses(),
+	)
 
 	log.Println("starting shared informers")
 	go sharedInfomers.Start(ctx.Done())
@@ -295,6 +316,7 @@ func (s *server) run() error {
 	sharedInfomers.WaitForCacheSync(ctx.Done())
 
 	go zoneController.Run(ctx, 1)
+	go backendControllerManager.run(ctx)
 
 	log.Println("waiting for term")
 	<-ctx.Done()
