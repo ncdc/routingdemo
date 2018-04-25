@@ -1,0 +1,16 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: kuard-v2
+  labels:
+    route: "true"
+    vhost: kuard.demo
+spec:
+  rules:
+  - host: kuard.demo
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: kuard-v2
+          servicePort: 8080

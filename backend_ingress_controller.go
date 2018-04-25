@@ -19,12 +19,14 @@ package main
 import (
 	"log"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"k8s.io/api/core/v1"
+	extensions "k8s.io/api/extensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
-	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
 	"k8s.io/client-go/kubernetes"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -34,25 +36,34 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
-type backendController struct {
+type backendIngressController struct {
 	*genericController
 
 	backend              *backend
-	backendClient        kubernetes.Interface
-	backendServiceLister corelisters.ServiceLister
 	backendIngressLister extensionslisters.IngressLister
 
+	routingServiceClient   coreclient.ServicesGetter
+	routingServiceLister   corelisters.ServiceLister
 	routingEndpointsClient coreclient.EndpointsGetter
+	routingEndpointsLister corelisters.EndpointsLister
 	routingIngressLister   extensionslisters.IngressLister
+	routingNamespaceClient coreclient.NamespacesGetter
 
 	ready chan struct{}
 }
 
-func newBackendController(
+const ingressRouteLabel = "route"
+const vhostLabel = "vhost"
+
+func newBackendIngressController(
 	backend *backend,
+	routingServiceClient coreclient.ServicesGetter,
+	routingServiceLister corelisters.ServiceLister,
 	routingEndpointsClient coreclient.EndpointsGetter,
-	routingIngressInformer extensionsinformers.IngressInformer,
-) *backendController {
+	routingEndpointsLister corelisters.EndpointsLister,
+	routingIngressLister extensionslisters.IngressLister,
+	routingNamespaceClient coreclient.NamespacesGetter,
+) *backendIngressController {
 	getter := func() (*clientcmdapi.Config, error) {
 		return clientcmd.Load([]byte(backend.kubeconfig))
 	}
@@ -67,54 +78,35 @@ func newBackendController(
 
 	backendInformers := informers.NewSharedInformerFactory(backendClient, 0)
 
-	c := &backendController{
+	c := &backendIngressController{
 		genericController: newGenericController("backend-handler"),
 
 		backend:              backend,
-		backendClient:        backendClient,
-		backendServiceLister: backendInformers.Core().V1().Services().Lister(),
 		backendIngressLister: backendInformers.Extensions().V1beta1().Ingresses().Lister(),
 
+		routingServiceClient:   routingServiceClient,
+		routingServiceLister:   routingServiceLister,
 		routingEndpointsClient: routingEndpointsClient,
-		routingIngressLister:   routingIngressInformer.Lister(),
+		routingEndpointsLister: routingEndpointsLister,
+		routingIngressLister:   routingIngressLister,
+		routingNamespaceClient: routingNamespaceClient,
 
 		ready: make(chan struct{}),
 	}
 	c.syncHandler = c.processBackendIngress
 	c.stopHandler = c.onStop
 
-	backendInformers.Core().V1().Services().Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    c.enqueue,
-			UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
-			DeleteFunc: c.enqueue,
-		},
-	)
-
-	/* TODO
-	1. Keep add-backend
-	2. Keep add-vhost, but have it only set up the routing ingress
-	3. Modify backend controller
-	   - Stop watching backend services
-	   - Copy backend service foo as routing service foo-<backend>
-	     - label it as service=foo
-	   - Sync backend ingress <foo> to routing ingress <foo>
-	     - add all services matching label service=foo as ingress http rules
-	*/
-
 	backendInformers.Extensions().V1beta1().Ingresses().Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    c.enqueue,
-			UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
-			DeleteFunc: c.enqueue,
-		},
-	)
-
-	routingIngressInformer.Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    c.enqueue,
-			UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
-			DeleteFunc: c.enqueue,
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				ingress := obj.(*extensions.Ingress)
+				return ingress.Labels[ingressRouteLabel] == "true"
+			},
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    c.enqueue,
+				UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
+				DeleteFunc: c.enqueue,
+			},
 		},
 	)
 
@@ -130,11 +122,11 @@ func newBackendController(
 	return c
 }
 
-func (c *backendController) log(msg string, args ...interface{}) {
+func (c *backendIngressController) log(msg string, args ...interface{}) {
 	log.Printf("["+c.backend.name+"] "+msg+"\n", args...)
 }
 
-func (c *backendController) processBackendIngress(key string) error {
+func (c *backendIngressController) processBackendIngress(key string) error {
 	c.log("processBackendIngress for %s", key)
 	c.log("waiting for ready")
 	<-c.ready
@@ -146,98 +138,120 @@ func (c *backendController) processBackendIngress(key string) error {
 		return nil
 	}
 
-	c.log("Checking for routing ingress for %s/%s", ns, name)
-	_, err = c.routingIngressLister.Ingresses(ns).Get(name)
+	c.log("Getting backend ingress %s/%s", ns, name)
+	backendIngress, err := c.backendIngressLister.Ingresses(ns).Get(name)
 	if apierrors.IsNotFound(err) {
-		c.log("No routing ingress for %s/%s, skipping", ns, name)
+		c.log("NOT FOUND backend ingress %s/%s", ns, name)
+		if err := c.deleteRoutingService(ns, name); err != nil {
+			return err
+		}
+		return c.deleteRoutingEndpoints(ns, name)
+	}
+	if err != nil {
+		return err
+	}
+	vhost := backendIngress.Labels[vhostLabel]
+	if vhost == "" {
+		c.log("No vhost for ingress %s/%s", ns, name)
 		return nil
 	}
-	if err != nil {
-		c.log("Error getting routing ingress %s: %v", name, err)
+
+	if err := c.ensureRoutingNamespace(ns); err != nil {
+		c.log("Error ensuring namespace %s in routing cluster: %v", ns, err)
 		return err
 	}
 
-	missingBackendIngress := false
-	missingBackendService := false
+	routingServiceName := name + "-" + c.backend.name
 
-	c.log("Checking for backend ingress for %s/%s", ns, name)
-	_, err = c.backendIngressLister.Ingresses(ns).Get(name)
+	c.log("Checking for routing service %s/%s", ns, routingServiceName)
+	_, err = c.routingServiceLister.Services(ns).Get(routingServiceName)
 	if apierrors.IsNotFound(err) {
-		c.log("No backend ingress for %s/%s", ns, name)
-		missingBackendIngress = true
-	} else if err != nil {
-		c.log("Error getting backend ingress %s: %v", name, err)
-		return err
-	}
-
-	c.log("Getting backend service %s/%s", ns, name)
-	_, err = c.backendServiceLister.Services(ns).Get(name)
-	if apierrors.IsNotFound(err) {
-		c.log("No backend service for %s/%s", ns, name)
-		missingBackendService = true
-	} else if err != nil {
-		c.log("error getting backend service: %v", err)
-		return err
-	}
-
-	if missingBackendIngress || missingBackendService {
-		c.log("Backend ingress or service missing - trying to remove related endpoint subset address %s/%s %s", ns, name, c.backend.ip)
-		err = c.deleteEndpointAddressForBackend(ns, name)
-		return err
-	}
-
-	c.log("found backend service - checking if we need to create/update endpoints")
-	endpoints, err := c.routingEndpointsClient.Endpoints(ns).Get(name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		c.log("couldn't find endpoints for %s/%s", ns, name)
-		// create endpoints
-		endpoints = &v1.Endpoints{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: ns,
-				Name:      name,
-			},
-			Subsets: []v1.EndpointSubset{
-				subsetForIP(c.backend.ip),
-			},
+		c.log("NOT FOUND routing service %s/%s", ns, routingServiceName)
+		if err := c.createRoutingService(ns, routingServiceName, vhost); err != nil {
+			return err
 		}
-
-		c.log("creating endpoints for %s/%s", ns, name)
-		_, err = c.routingEndpointsClient.Endpoints(ns).Create(endpoints)
-		return err
+		return c.createRoutingEndpoints(ns, routingServiceName)
 	}
 	if err != nil {
-		c.log("error getting endpoints %s/%s: %v", ns, name, err)
 		return err
 	}
 
-	c.log("found endpoints for %s/%s - checking if we need to add an address for %s:%s", ns, name, c.backend.name, c.backend.ip)
-	found := false
-	if len(endpoints.Subsets) > 0 {
-		subset := endpoints.Subsets[0]
-		for _, address := range subset.Addresses {
-			if address.IP == c.backend.ip {
-				c.log("address found for %s/%s %s:%s", ns, name, c.backend.name, c.backend.ip)
-				found = true
-				break
-			}
-		}
-	}
+	c.log("FOUND routing service %s/%s", ns, routingServiceName)
+	//c.reconcileRoutingService(ns, routingServiceName, routingService)
 
-	if !found {
-		if len(endpoints.Subsets) == 0 {
-			endpoints.Subsets = append(endpoints.Subsets, subsetForIP(c.backend.ip))
-		} else {
-			c.log("need to add address for %s/%s %s:%s", ns, name, c.backend.name, c.backend.ip)
-			endpoints.Subsets[0].Addresses = append(endpoints.Subsets[0].Addresses, v1.EndpointAddress{IP: c.backend.ip})
-		}
-		_, err = c.routingEndpointsClient.Endpoints(ns).Update(endpoints)
+	c.log("Checking for routing endpoints %s/%s", ns, routingServiceName)
+	_, err = c.routingEndpointsLister.Endpoints(ns).Get(routingServiceName)
+	if apierrors.IsNotFound(err) {
+		c.log("NOT FOUND routing endpoints %s/%s", ns, routingServiceName)
+		return c.createRoutingEndpoints(ns, routingServiceName)
+	}
+	if err != nil {
 		return err
 	}
 
+	c.log("FOUND routing endpoints %s/%s", ns, routingServiceName)
+	//return c.reconcileRoutingEndpoints(ns, routingServiceName, routingEndpoints)
 	return nil
 }
 
-func (c *backendController) onStop() {
+func (c *backendIngressController) createRoutingService(ns, name, vhost string) error {
+	service := v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      name,
+			Labels: map[string]string{
+				vhostLabel: vhost,
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Type:      v1.ServiceTypeClusterIP,
+			ClusterIP: "None",
+			Ports: []v1.ServicePort{
+				{
+					Name:       "http",
+					Protocol:   "TCP",
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
+		},
+	}
+	_, err := c.routingServiceClient.Services(ns).Create(&service)
+	return err
+}
+
+func (c *backendIngressController) deleteRoutingService(ns, name string) error {
+	err := c.routingServiceClient.Services(ns).Delete(name, nil)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func (c *backendIngressController) createRoutingEndpoints(ns, name string) error {
+	endpoints := v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      name,
+		},
+		Subsets: []v1.EndpointSubset{
+			subsetForIP(c.backend.ip),
+		},
+	}
+
+	_, err := c.routingEndpointsClient.Endpoints(ns).Create(&endpoints)
+	return err
+}
+
+func (c *backendIngressController) deleteRoutingEndpoints(ns, name string) error {
+	err := c.routingEndpointsClient.Endpoints(ns).Delete(name, nil)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func (c *backendIngressController) onStop() {
 	c.log("onStop begin")
 
 	routingIngresses, err := c.routingIngressLister.List(labels.Everything())
@@ -268,7 +282,7 @@ func (c *backendController) onStop() {
 	}
 }
 
-func (c *backendController) deleteEndpointAddressForBackend(ns, name string) error {
+func (c *backendIngressController) deleteEndpointAddressForBackend(ns, name string) error {
 	endpoints, err := c.routingEndpointsClient.Endpoints(ns).Get(name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		c.log("Endpoints for %s/%s don't exist - no-op", ns, name)
@@ -303,19 +317,16 @@ func (c *backendController) deleteEndpointAddressForBackend(ns, name string) err
 	return nil
 }
 
-func subsetForIP(ip string) v1.EndpointSubset {
-	return v1.EndpointSubset{
-		Addresses: []v1.EndpointAddress{
-			{
-				IP: ip,
+func (c *backendIngressController) ensureRoutingNamespace(ns string) error {
+	_, err := c.routingNamespaceClient.Namespaces().Get(ns, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		n := v1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ns,
 			},
-		},
-		Ports: []v1.EndpointPort{
-			{
-				Name:     "http",
-				Port:     80,
-				Protocol: "TCP",
-			},
-		},
+		}
+		_, err = c.routingNamespaceClient.Namespaces().Create(&n)
+		return err
 	}
+	return err
 }

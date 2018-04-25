@@ -20,85 +20,141 @@ import (
 	"context"
 	"log"
 
-	"k8s.io/apimachinery/pkg/util/sets"
-	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
+	"k8s.io/api/core/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	extensionslisters "k8s.io/client-go/listers/extensions/v1beta1"
 )
 
-type backendControllerManager struct {
-	backends           <-chan []*backend
-	backendControllers map[string]*backendController
-	cancels            map[string]func()
+type backendIngressControllerManager struct {
+	*genericController
 
+	secretsLister          corelisters.SecretLister
+	routingServiceClient   coreclient.ServicesGetter
+	routingServiceLister   corelisters.ServiceLister
 	routingEndpointsClient coreclient.EndpointsGetter
-	routingIngressInformer extensionsinformers.IngressInformer
+	routingEndpointsLister corelisters.EndpointsLister
+	routingIngressLister   extensionslisters.IngressLister
+	routingNamespaceClient coreclient.NamespacesGetter
+
+	backendIngressControllers map[string]*backendIngressController
+	cancels                   map[string]func()
 }
 
-func newBackendControllerManager(
-	backends <-chan []*backend,
+func newBackendIngressControllerManager(
+	secretsInformer coreinformers.SecretInformer,
+	routingServiceClient coreclient.ServicesGetter,
+	routingServiceInformer coreinformers.ServiceInformer,
 	routingEndpointsClient coreclient.EndpointsGetter,
+	routingEndpointsInformer coreinformers.EndpointsInformer,
 	routingIngressInformer extensionsinformers.IngressInformer,
-) *backendControllerManager {
-	m := &backendControllerManager{
-		backends:               backends,
-		backendControllers:     make(map[string]*backendController),
-		cancels:                make(map[string]func()),
+	routingNamespaceClient coreclient.NamespacesGetter,
+) *backendIngressControllerManager {
+	m := &backendIngressControllerManager{
+		genericController: newGenericController("backends"),
+
+		secretsLister:          secretsInformer.Lister(),
+		routingServiceClient:   routingServiceClient,
+		routingServiceLister:   routingServiceInformer.Lister(),
 		routingEndpointsClient: routingEndpointsClient,
-		routingIngressInformer: routingIngressInformer,
+		routingEndpointsLister: routingEndpointsInformer.Lister(),
+		routingIngressLister:   routingIngressInformer.Lister(),
+		routingNamespaceClient: routingNamespaceClient,
+
+		backendIngressControllers: make(map[string]*backendIngressController),
+		cancels:                   make(map[string]func()),
 	}
-	// make sure the routing ingress informer gets started
-	_ = routingIngressInformer.Informer()
+	m.syncHandler = m.processSecret
+
+	secretsInformer.Informer().AddEventHandler(
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				secret := obj.(*v1.Secret)
+				return secret.Labels[backendLabel] == "true"
+			},
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    m.enqueue,
+				UpdateFunc: func(_, obj interface{}) { m.enqueue(obj) },
+				DeleteFunc: m.enqueue,
+			},
+		},
+	)
 
 	return m
 }
 
-func (m *backendControllerManager) run(ctx context.Context) {
-	for {
-		log.Println("backendControllerManager waiting for updates")
-		select {
-		case <-ctx.Done():
-			return
-		case backends := <-m.backends:
-			m.handleUpdate(ctx, backends)
-		}
-	}
-}
+func (m *backendIngressControllerManager) processSecret(key string) error {
+	log.Println("backendIngressControllerManager.processSecret start")
+	defer log.Println("backendIngressControllerManager.processSecret end")
 
-func (m *backendControllerManager) handleUpdate(parentCtx context.Context, backends []*backend) {
-	log.Println("backendControllerManager.handleUpdate start")
-	defer log.Println("backendControllerManager.handleUpdate end")
-
-	namesToKeep := sets.NewString()
-
-	for _, be := range backends {
-		namesToKeep.Insert(be.name)
-
-		if _, exists := m.backendControllers[be.name]; !exists {
-			ctx, cancel := context.WithCancel(parentCtx)
-			m.cancels[be.name] = cancel
-
-			c := newBackendController(be, m.routingEndpointsClient, m.routingIngressInformer)
-			m.backendControllers[be.name] = c
-
-			go c.Run(ctx, 1)
-		}
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		m.log("error splitting key %s: %v", key, err)
+		return nil
 	}
 
-	log.Println("namesToKeep", namesToKeep)
-
-	allNames := sets.StringKeySet(m.backendControllers)
-	log.Println("allNames", allNames)
-
-	namesToDelete := allNames.Difference(namesToKeep)
-	log.Println("namesToDelete", namesToDelete)
-
-	for _, name := range namesToDelete.List() {
-		log.Println("canceling backendController", name)
+	secret, err := m.secretsLister.Secrets(ns).Get(name)
+	if apierrors.IsNotFound(err) {
+		m.log("Couldn't find %s/%s - stopping backend ingress controller for it", ns, name)
+		m.log("canceling backendIngressController %s", name)
 		cancel := m.cancels[name]
 		cancel()
 
-		log.Println("removing backendController", name)
+		m.log("removing backendIngressController %s", name)
 		delete(m.cancels, name)
-		delete(m.backendControllers, name)
+		delete(m.backendIngressControllers, name)
 	}
+	if err != nil {
+		return err
+	}
+
+	if _, exists := m.backendIngressControllers[name]; !exists {
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancels[name] = cancel
+
+		be := &backend{
+			name:       name,
+			ip:         string(secret.Data["ip"]),
+			kubeconfig: string(secret.Data["kubeconfig"]),
+		}
+
+		c := newBackendIngressController(
+			be,
+			m.routingServiceClient,
+			m.routingServiceLister,
+			m.routingEndpointsClient,
+			m.routingEndpointsLister,
+			m.routingIngressLister,
+			m.routingNamespaceClient,
+		)
+		m.backendIngressControllers[name] = c
+
+		go c.Run(ctx, 1)
+	}
+
+	return nil
+
+	// namesToKeep := sets.NewString()
+
+	// for _, be := range backends {
+	// 	namesToKeep.Insert(be.name)
+
+	// }
+
+	// log.Println("namesToKeep", namesToKeep)
+
+	// allNames := sets.StringKeySet(m.backendIngressControllers)
+	// log.Println("allNames", allNames)
+
+	// namesToDelete := allNames.Difference(namesToKeep)
+	// log.Println("namesToDelete", namesToDelete)
+
+	// for _, name := range namesToDelete.List() {
+
+	// }
 }

@@ -74,6 +74,11 @@ func main() {
 		{
 			Name:   "add-vhost",
 			Action: addVhost,
+			Flags: []cli.Flag{
+				cli.StringSliceFlag{
+					Name: "services",
+				},
+			},
 		},
 		{
 			Name:   "delete-vhost",
@@ -106,6 +111,8 @@ func getClient(config string) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(clientConfig)
 }
 
+const backendLabel = "backend"
+
 func addBackend(c *cli.Context) error {
 	name := c.Args().Get(0)
 	ip := c.Args().Get(1)
@@ -121,18 +128,21 @@ func addBackend(c *cli.Context) error {
 		return err
 	}
 
-	backend := v1.ConfigMap{
+	backend := v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: routingNamespace,
 			Name:      name,
+			Labels: map[string]string{
+				backendLabel: "true",
+			},
 		},
-		Data: map[string]string{
+		StringData: map[string]string{
 			"ip":         ip,
 			"kubeconfig": string(kubeconfigContents),
 		},
 	}
 
-	_, err = client.CoreV1().ConfigMaps(routingNamespace).Create(&backend)
+	_, err = client.CoreV1().Secrets(routingNamespace).Create(&backend)
 
 	return err
 }
@@ -145,7 +155,7 @@ func deleteBackend(c *cli.Context) error {
 		return err
 	}
 
-	return client.CoreV1().ConfigMaps(routingNamespace).Delete(name, nil)
+	return client.CoreV1().Secrets(routingNamespace).Delete(name, nil)
 }
 
 func listBackends(c *cli.Context) error {
@@ -154,7 +164,7 @@ func listBackends(c *cli.Context) error {
 		return err
 	}
 
-	list, err := client.CoreV1().ConfigMaps(routingNamespace).List(metav1.ListOptions{})
+	list, err := client.CoreV1().Secrets(routingNamespace).List(metav1.ListOptions{LabelSelector: backendLabel + "=true"})
 	if err != nil {
 		return err
 	}
@@ -173,14 +183,13 @@ func addVhost(c *cli.Context) error {
 	}
 
 	vhost := c.Args().Get(0)
-	//selector := c.Args().Get(1)
 
 	ingress := v1beta1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: vhost,
-			// Annotations: map[string]string{
-			// 	"routing.selector": selector,
-			// },
+			Annotations: map[string]string{
+				"weightedCluster": "true",
+			},
 		},
 		Spec: v1beta1.IngressSpec{
 			Rules: []v1beta1.IngressRule{
@@ -192,7 +201,7 @@ func addVhost(c *cli.Context) error {
 								{
 									Path: "/",
 									Backend: v1beta1.IngressBackend{
-										ServiceName: vhost,
+										ServiceName: "temporary-placeholder",
 										ServicePort: intstr.FromInt(8080),
 									},
 								},
@@ -208,27 +217,27 @@ func addVhost(c *cli.Context) error {
 		return err
 	}
 
-	service := v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: vhost,
-		},
-		Spec: v1.ServiceSpec{
-			Type:      v1.ServiceTypeClusterIP,
-			ClusterIP: "None",
-			Ports: []v1.ServicePort{
-				{
-					Name:       "http",
-					Protocol:   "TCP",
-					Port:       8080,
-					TargetPort: intstr.FromInt(8080),
-				},
-			},
-		},
-	}
+	// service := v1.Service{
+	// 	ObjectMeta: metav1.ObjectMeta{
+	// 		Name: vhost,
+	// 	},
+	// 	Spec: v1.ServiceSpec{
+	// 		Type:      v1.ServiceTypeClusterIP,
+	// 		ClusterIP: "None",
+	// 		Ports: []v1.ServicePort{
+	// 			{
+	// 				Name:       "http",
+	// 				Protocol:   "TCP",
+	// 				Port:       8080,
+	// 				TargetPort: intstr.FromInt(8080),
+	// 			},
+	// 		},
+	// 	},
+	// }
 
-	if _, err := client.CoreV1().Services(namespace).Create(&service); err != nil {
-		return err
-	}
+	// if _, err := client.CoreV1().Services(namespace).Create(&service); err != nil {
+	// 	return err
+	// }
 
 	return nil
 }
@@ -245,9 +254,9 @@ func deleteVhost(c *cli.Context) error {
 		return err
 	}
 
-	if err := client.CoreV1().Services(namespace).Delete(vhost, nil); err != nil {
-		return err
-	}
+	// if err := client.CoreV1().Services(namespace).Delete(vhost, nil); err != nil {
+	// 	return err
+	// }
 
 	return nil
 }
@@ -290,33 +299,35 @@ func (s *server) run() error {
 	s.client = client
 
 	log.Println("creating shared informer factory")
-	sharedInfomers := informers.NewSharedInformerFactory(client, 0)
+	sharedInformers := informers.NewSharedInformerFactory(client, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	backends := make(chan []*backend, 1)
-
-	zoneController := newZoneController(
-		client.CoreV1(),
-		sharedInfomers.Core().V1().ConfigMaps(),
-		backends,
+	backendIngressControllerManager := newBackendIngressControllerManager(
+		sharedInformers.Core().V1().Secrets(),
+		client.CoreV1(), // routingServiceClient
+		sharedInformers.Core().V1().Services(),
+		client.CoreV1(), // routingEndpointsClient
+		sharedInformers.Core().V1().Endpoints(),
+		sharedInformers.Extensions().V1beta1().Ingresses(),
+		client.CoreV1(), // routingNamespaceClient
 	)
 
-	backendControllerManager := newBackendControllerManager(
-		backends,
-		client.CoreV1(),
-		sharedInfomers.Extensions().V1beta1().Ingresses(),
+	routingIngressController := newRoutingIngressController(
+		sharedInformers.Core().V1().Services(),
+		client.ExtensionsV1beta1(), // routingIngressClient
+		sharedInformers.Extensions().V1beta1().Ingresses(),
 	)
 
 	log.Println("starting shared informers")
-	go sharedInfomers.Start(ctx.Done())
+	go sharedInformers.Start(ctx.Done())
 
 	log.Println("waiting for cache sync")
-	sharedInfomers.WaitForCacheSync(ctx.Done())
+	sharedInformers.WaitForCacheSync(ctx.Done())
 
-	go zoneController.Run(ctx, 1)
-	go backendControllerManager.run(ctx)
+	go backendIngressControllerManager.Run(ctx, 1)
+	go routingIngressController.Run(ctx, 1)
 
 	log.Println("waiting for term")
 	<-ctx.Done()

@@ -88,22 +88,44 @@ func (c *zoneController) rebuildZone(key string) error {
 		return err
 	}
 
+	if zonesCM.Data == nil {
+		zonesCM.Data = make(map[string]string)
+	}
 	zone := zonesCM.Data["db.backend"]
 
+	var soa *dns.SOA
 	log.Println("parsing zone")
-	token := <-dns.ParseZone(strings.NewReader(zone), "", "")
-	if token.Error != nil {
-		c.log("error parsing zone: %v", err)
-		return token.Error
-	}
-
-	soa, ok := token.RR.(*dns.SOA)
+	token, ok := <-dns.ParseZone(strings.NewReader(zone), "", "")
 	if !ok {
-		msg := fmt.Sprintf("%T is not a *dns.SOA: %#v\n", token.RR, token.RR)
-		log.Println(msg)
-		return errors.New(msg)
-	}
+		soa = &dns.SOA{
+			Hdr: dns.RR_Header{
+				Name:     "backend.",
+				Rrtype:   dns.TypeSOA,
+				Class:    dns.ClassINET,
+				Ttl:      0,
+				Rdlength: 0,
+			},
+			Ns:      "ns.backend.",
+			Mbox:    "",
+			Serial:  0,
+			Refresh: 7200,
+			Retry:   3600,
+			Expire:  1209600,
+			Minttl:  3600,
+		}
+	} else {
+		if token.Error != nil {
+			c.log("error parsing zone: %v", err)
+			return token.Error
+		}
 
+		soa, ok = token.RR.(*dns.SOA)
+		if !ok {
+			msg := fmt.Sprintf("%T is not a *dns.SOA: %#v\n", token.RR, token.RR)
+			log.Println(msg)
+			return errors.New(msg)
+		}
+	}
 	soa.Serial++
 	zone = soa.String() + "\n"
 
