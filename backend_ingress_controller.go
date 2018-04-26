@@ -280,41 +280,6 @@ func (c *backendIngressController) onStop() {
 	}
 }
 
-func (c *backendIngressController) deleteEndpointAddressForBackend(ns, name string) error {
-	endpoints, err := c.routingEndpointsClient.Endpoints(ns).Get(name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		c.log("Endpoints for %s/%s don't exist - no-op", ns, name)
-		return nil
-	}
-	if err != nil {
-		c.log("error getting endpoints for %s/%s", ns, name)
-		return err
-	}
-	if len(endpoints.Subsets) == 0 {
-		c.log("no subsets for %s/%s - no-op", ns, name)
-		return nil
-	}
-
-	var newAddresses []v1.EndpointAddress
-
-	subset := &endpoints.Subsets[0]
-	for i := range subset.Addresses {
-		address := subset.Addresses[i]
-		c.log("checking subset with ip %s", address.IP)
-		if address.IP == c.backend.ip {
-			c.log("found the one we want to remove")
-		} else {
-			c.log("keeping %s", address.IP)
-			newAddresses = append(newAddresses, address)
-		}
-	}
-	subset.Addresses = newAddresses
-	c.log("updating subset to %#v", subset)
-
-	_, err = c.routingEndpointsClient.Endpoints(ns).Update(endpoints)
-	return nil
-}
-
 func (c *backendIngressController) ensureRoutingNamespace(ns string) error {
 	_, err := c.routingNamespaceClient.Namespaces().Get(ns, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
