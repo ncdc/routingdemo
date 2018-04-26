@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -97,16 +96,10 @@ func newBackendIngressController(
 	c.stopHandler = c.onStop
 
 	backendInformers.Extensions().V1beta1().Ingresses().Informer().AddEventHandler(
-		cache.FilteringResourceEventHandler{
-			FilterFunc: func(obj interface{}) bool {
-				ingress := obj.(*extensions.Ingress)
-				return ingress.Labels[ingressRouteLabel] == "true"
-			},
-			Handler: cache.ResourceEventHandlerFuncs{
-				AddFunc:    c.enqueue,
-				UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
-				DeleteFunc: c.enqueue,
-			},
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    c.enqueue,
+			UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
+			DeleteFunc: c.enqueue,
 		},
 	)
 
@@ -142,18 +135,29 @@ func (c *backendIngressController) processBackendIngress(key string) error {
 		return nil
 	}
 
+	routingServiceName := nameWithBackend(name, c.backend.name)
+
 	c.log("Getting backend ingress %s/%s", ns, name)
 	backendIngress, err := c.backendIngressLister.Ingresses(ns).Get(name)
 	if apierrors.IsNotFound(err) {
 		c.log("NOT FOUND backend ingress %s/%s", ns, name)
-		if err := c.deleteRoutingService(ns, name); err != nil {
+		if err := c.deleteRoutingService(ns, routingServiceName); err != nil {
 			return err
 		}
-		return c.deleteRoutingEndpoints(ns, name)
+		return c.deleteRoutingEndpoints(ns, routingServiceName)
 	}
 	if err != nil {
 		return err
 	}
+
+	if backendIngress.Labels[ingressRouteLabel] != "true" {
+		c.log("MISSING ROUTE LABEL backend ingress %s/%s", ns, name)
+		if err := c.deleteRoutingService(ns, routingServiceName); err != nil {
+			return err
+		}
+		return c.deleteRoutingEndpoints(ns, routingServiceName)
+	}
+
 	vhost := backendIngress.Labels[vhostLabel]
 	if vhost == "" {
 		c.log("No vhost for ingress %s/%s", ns, name)
@@ -164,8 +168,6 @@ func (c *backendIngressController) processBackendIngress(key string) error {
 		c.log("Error ensuring namespace %s in routing cluster: %v", ns, err)
 		return err
 	}
-
-	routingServiceName := name + "-" + c.backend.name
 
 	c.log("Checking for routing service %s/%s", ns, routingServiceName)
 	_, err = c.routingServiceLister.Services(ns).Get(routingServiceName)

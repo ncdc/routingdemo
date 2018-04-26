@@ -18,13 +18,17 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 
 	jsonpatch "github.com/evanphx/json-patch"
 	"k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	extensionsclient "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
@@ -108,6 +112,11 @@ func (c *routingIngressController) processIngress(key string) error {
 		return err
 	}
 
+	if ingress.Annotations["weightedCluster"] != "true" {
+		c.log("%s isn't a weightedCluster ingress", key)
+		return nil
+	}
+
 	original := ingress
 	ingress = ingress.DeepCopy()
 
@@ -132,8 +141,18 @@ func (c *routingIngressController) processIngress(key string) error {
 		c.log("error listing services for vhost %s: %v", vhost, err)
 		return err
 	}
+
+	serviceNames := sets.NewString()
+
 	if len(services) == 0 {
 		c.log("No services matching %s=%s for ingress %s", vhostLabel, vhost, key)
+
+		for k := range ingress.Annotations {
+			if strings.HasPrefix(k, "weight.") {
+				delete(ingress.Annotations, k)
+			}
+		}
+
 		rule.HTTP.Paths = []v1beta1.HTTPIngressPath{
 			{
 				Path: "/",
@@ -144,8 +163,26 @@ func (c *routingIngressController) processIngress(key string) error {
 			},
 		}
 	} else {
-		var paths []v1beta1.HTTPIngressPath
+		c.log("Found %d services matching %s=%s for ingress %s", len(services), vhostLabel, vhost, key)
+		haveWeights := false
 		for _, service := range services {
+			if ingress.Annotations["weight."+service.Name] != "" {
+				haveWeights = true
+				break
+			}
+		}
+
+		var paths []v1beta1.HTTPIngressPath
+		for i, service := range services {
+			c.log("Found routable service %s/%s", service.Namespace, service.Name)
+			serviceNames.Insert(service.Name)
+
+			if !haveWeights && i == 0 {
+				ingress.Annotations["weight."+service.Name] = "100"
+			}
+			if ingress.Annotations["weight."+service.Name] == "" {
+				ingress.Annotations["weight."+service.Name] = "0"
+			}
 			path := v1beta1.HTTPIngressPath{
 				Path: "/",
 				Backend: v1beta1.IngressBackend{
@@ -160,9 +197,43 @@ func (c *routingIngressController) processIngress(key string) error {
 		rule.HTTP.Paths = paths
 	}
 
+	for k := range ingress.Annotations {
+		if strings.HasPrefix(k, "weight.") {
+			parts := strings.Split(k, ".")
+			if !serviceNames.Has(parts[1]) {
+				c.log("Removing weight annotation %s", k)
+				delete(ingress.Annotations, k)
+			}
+		}
+	}
+
 	if reflect.DeepEqual(original.Spec, ingress.Spec) && reflect.DeepEqual(original.Annotations, ingress.Annotations) {
 		c.log("No changes for routing ingress %s", key)
 		return nil
+	}
+
+	if len(services) > 0 {
+		// see if we need to adjust any weights
+		c.log("Checking if we need to adjust weights")
+		total := 0
+		firstWeight := 0
+		for i, service := range services {
+			weight, err := strconv.Atoi(ingress.Annotations["weight."+service.Name])
+			if err != nil {
+				c.log("error parsing %s: %v", ingress.Annotations["weight."+service.Name], err)
+				return nil
+			}
+			total += weight
+			if i == 0 {
+				firstWeight = weight
+			}
+		}
+		remainder := 100 - total
+		if remainder > 0 {
+			firstWeight += remainder
+			c.log("Adjusting weight for %s from %d to %d", services[0].Name, firstWeight-remainder, firstWeight)
+			ingress.Annotations["weight."+services[0].Name] = fmt.Sprintf("%d", firstWeight)
+		}
 	}
 
 	c.log("Trying to update ingress %s to %#v", key, ingress)
