@@ -21,20 +21,25 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
+	"net/url"
 	"os"
-
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"os/user"
+	"path/filepath"
 
 	cli "gopkg.in/urfave/cli.v1"
+	"gopkg.in/yaml.v2"
 	"k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 const routingNamespace = "routing"
+const demoNamespace = "demo"
 
 var routerKubeconfig string
 var namespace string
@@ -54,7 +59,7 @@ func main() {
 	}
 	app.Before = func(c *cli.Context) error {
 		if namespace == "" {
-			namespace = routingNamespace
+			namespace = demoNamespace
 		}
 		return nil
 	}
@@ -115,15 +120,41 @@ const backendLabel = "backend"
 
 func addBackend(c *cli.Context) error {
 	name := c.Args().Get(0)
-	ip := c.Args().Get(1)
-	kubeconfig := c.Args().Get(2)
 
 	client, err := getClient(routerKubeconfig)
 	if err != nil {
 		return err
 	}
 
-	kubeconfigContents, err := ioutil.ReadFile(kubeconfig)
+	usr, err := user.Current()
+	if err != nil {
+		return err
+	}
+
+	kubeconfigContents, err := ioutil.ReadFile(filepath.Join(usr.HomeDir, ".kube", name))
+	if err != nil {
+		return err
+	}
+
+	type kcCluster struct {
+		Server string `yaml:"server"`
+	}
+	type kcClusterEnvelope struct {
+		Cluster kcCluster `yaml:"cluster"`
+	}
+	type kc struct {
+		Clusters []kcClusterEnvelope `yaml:"clusters"`
+	}
+
+	var kubeconfigData kc
+	if err := yaml.Unmarshal(kubeconfigContents, &kubeconfigData); err != nil {
+		return err
+	}
+	u, err := url.Parse(kubeconfigData.Clusters[0].Cluster.Server)
+	if err != nil {
+		return err
+	}
+	ip, _, err := net.SplitHostPort(u.Host)
 	if err != nil {
 		return err
 	}
@@ -217,28 +248,6 @@ func addVhost(c *cli.Context) error {
 		return err
 	}
 
-	// service := v1.Service{
-	// 	ObjectMeta: metav1.ObjectMeta{
-	// 		Name: vhost,
-	// 	},
-	// 	Spec: v1.ServiceSpec{
-	// 		Type:      v1.ServiceTypeClusterIP,
-	// 		ClusterIP: "None",
-	// 		Ports: []v1.ServicePort{
-	// 			{
-	// 				Name:       "http",
-	// 				Protocol:   "TCP",
-	// 				Port:       8080,
-	// 				TargetPort: intstr.FromInt(8080),
-	// 			},
-	// 		},
-	// 	},
-	// }
-
-	// if _, err := client.CoreV1().Services(namespace).Create(&service); err != nil {
-	// 	return err
-	// }
-
 	return nil
 }
 
@@ -253,10 +262,6 @@ func deleteVhost(c *cli.Context) error {
 	if err := client.ExtensionsV1beta1().Ingresses(namespace).Delete(vhost, nil); err != nil {
 		return err
 	}
-
-	// if err := client.CoreV1().Services(namespace).Delete(vhost, nil); err != nil {
-	// 	return err
-	// }
 
 	return nil
 }

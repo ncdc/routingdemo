@@ -19,13 +19,13 @@ package main
 import (
 	"log"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"k8s.io/api/core/v1"
 	extensions "k8s.io/api/extensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -126,6 +126,10 @@ func (c *backendIngressController) log(msg string, args ...interface{}) {
 	log.Printf("["+c.backend.name+"] "+msg+"\n", args...)
 }
 
+func nameWithBackend(name, backend string) string {
+	return name + "-" + backend
+}
+
 func (c *backendIngressController) processBackendIngress(key string) error {
 	c.log("processBackendIngress for %s", key)
 	c.log("waiting for ready")
@@ -167,10 +171,10 @@ func (c *backendIngressController) processBackendIngress(key string) error {
 	_, err = c.routingServiceLister.Services(ns).Get(routingServiceName)
 	if apierrors.IsNotFound(err) {
 		c.log("NOT FOUND routing service %s/%s", ns, routingServiceName)
-		if err := c.createRoutingService(ns, routingServiceName, vhost); err != nil {
+		if err := c.createRoutingService(ns, name, c.backend.name, vhost); err != nil {
 			return err
 		}
-		return c.createRoutingEndpoints(ns, routingServiceName)
+		return c.createRoutingEndpoints(ns, name, c.backend.name)
 	}
 	if err != nil {
 		return err
@@ -183,7 +187,7 @@ func (c *backendIngressController) processBackendIngress(key string) error {
 	_, err = c.routingEndpointsLister.Endpoints(ns).Get(routingServiceName)
 	if apierrors.IsNotFound(err) {
 		c.log("NOT FOUND routing endpoints %s/%s", ns, routingServiceName)
-		return c.createRoutingEndpoints(ns, routingServiceName)
+		return c.createRoutingEndpoints(ns, name, c.backend.name)
 	}
 	if err != nil {
 		return err
@@ -194,13 +198,14 @@ func (c *backendIngressController) processBackendIngress(key string) error {
 	return nil
 }
 
-func (c *backendIngressController) createRoutingService(ns, name, vhost string) error {
+func (c *backendIngressController) createRoutingService(ns, name, backend, vhost string) error {
 	service := v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns,
-			Name:      name,
+			Name:      nameWithBackend(name, backend),
 			Labels: map[string]string{
-				vhostLabel: vhost,
+				vhostLabel:   vhost,
+				backendLabel: backend,
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -228,11 +233,14 @@ func (c *backendIngressController) deleteRoutingService(ns, name string) error {
 	return err
 }
 
-func (c *backendIngressController) createRoutingEndpoints(ns, name string) error {
+func (c *backendIngressController) createRoutingEndpoints(ns, name, backend string) error {
 	endpoints := v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns,
-			Name:      name,
+			Name:      nameWithBackend(name, backend),
+			Labels: map[string]string{
+				backendLabel: backend,
+			},
 		},
 		Subsets: []v1.EndpointSubset{
 			subsetForIP(c.backend.ip),
@@ -253,31 +261,19 @@ func (c *backendIngressController) deleteRoutingEndpoints(ns, name string) error
 
 func (c *backendIngressController) onStop() {
 	c.log("onStop begin")
+	c.log("onStop end")
 
-	routingIngresses, err := c.routingIngressLister.List(labels.Everything())
+	// delete all services labeled backend=x, which also deletes endpoints
+	c.log("listing services for backend")
+	services, err := c.routingServiceLister.List(labels.SelectorFromSet(labels.Set{backendLabel: c.backend.name}))
 	if err != nil {
-		c.log("error listing routing ingresses: %v", err)
-		return
-	}
-
-	for _, routingIngress := range routingIngresses {
-		c.log("evaluating routing ingress %s/%s", routingIngress.Namespace, routingIngress.Name)
-
-		// if there's not a corresponding backend ingress, skip
-		_, err := c.backendIngressLister.Ingresses(routingIngress.Namespace).Get(routingIngress.Name)
-		if apierrors.IsNotFound(err) {
-			c.log("no backend ingress %s/%s - skipping", routingIngress.Namespace, routingIngress.Name)
-			continue
-		}
-		if err != nil {
-			c.log("error getting backend ingress %s/%s: %v", routingIngress.Namespace, routingIngress.Name, err)
-			continue
-		}
-
-		c.log("trying to delete %s from endpoints %s/%s", c.backend.ip, routingIngress.Namespace, routingIngress.Name)
-		err = c.deleteEndpointAddressForBackend(routingIngress.Namespace, routingIngress.Name)
-		if err != nil {
-			c.log("error deleting %s from endpoints %s/%s: %v", c.backend.ip, routingIngress.Namespace, routingIngress.Name, err)
+		c.log("onStop error listing services: %v", err)
+	} else {
+		for _, service := range services {
+			c.log("deleting service %s/%s", service.Namespace, service.Name)
+			if err = c.routingServiceClient.Services(service.Namespace).Delete(service.Name, nil); err != nil {
+				c.log("onStop error deleting service %s/%s: %v", service.Namespace, service.Name, err)
+			}
 		}
 	}
 }

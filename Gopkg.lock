@@ -8,6 +8,12 @@
   version = "v1.1.0"
 
 [[projects]]
+  name = "github.com/evanphx/json-patch"
+  packages = ["."]
+  revision = "afac545df32f2287a079e2dfb7ba2745a643747e"
+  version = "v3.0.0"
+
+[[projects]]
   name = "github.com/ghodss/yaml"
   packages = ["."]
   revision = "0ca9ea5df5451ffdf184b4428c902747c2c11cd7"
@@ -397,6 +403,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "00ce1c9b431b68ad5acf8afaae6ac932965df8900d3a72b1aedfa364af37ecf7"
+  inputs-digest = "72d1d6151f5cffdf04390b592084e7e0552051fcfe47e9f7ab9216197fd96b70"
   solver-name = "gps-cdcl"
   solver-version = 1

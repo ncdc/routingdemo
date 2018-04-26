@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"log"
 
 	"k8s.io/api/core/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -89,8 +88,8 @@ func newBackendIngressControllerManager(
 }
 
 func (m *backendIngressControllerManager) processSecret(key string) error {
-	log.Println("backendIngressControllerManager.processSecret start")
-	defer log.Println("backendIngressControllerManager.processSecret end")
+	m.log("backendIngressControllerManager.processSecret start for %s", key)
+	defer m.log("backendIngressControllerManager.processSecret end %s", key)
 
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -108,6 +107,8 @@ func (m *backendIngressControllerManager) processSecret(key string) error {
 		m.log("removing backendIngressController %s", name)
 		delete(m.cancels, name)
 		delete(m.backendIngressControllers, name)
+
+		return nil
 	}
 	if err != nil {
 		return err

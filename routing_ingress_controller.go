@@ -17,10 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	"k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -105,24 +108,8 @@ func (c *routingIngressController) processIngress(key string) error {
 		return err
 	}
 
-	// var observedGeneration int64
-	// s := ingress.Annotations["observedGeneration"]
-	// if s != "" {
-	// 	i, err := strconv.ParseInt(s, 10, 64)
-	// 	if err != nil {
-	// 		c.log("Error parsing observedGeneration %s: %v", s, err)
-	// 	} else {
-	// 		observedGeneration = i
-	// 	}
-	// }
-	// if observedGeneration == ingress.Generation {
-	// 	c.log("observedGeneration %d == generation %d for %s", observedGeneration, ingress.Generation, key)
-	// 	return nil
-	// }
 	original := ingress
 	ingress = ingress.DeepCopy()
-
-	//ingress.Annotations["observedGeneration"] = strconv.FormatInt(ingress.Generation, 10)
 
 	if len(ingress.Spec.Rules) == 0 {
 		c.log("ingress %s has 0 rules", key)
@@ -147,23 +134,31 @@ func (c *routingIngressController) processIngress(key string) error {
 	}
 	if len(services) == 0 {
 		c.log("No services matching %s=%s for ingress %s", vhostLabel, vhost, key)
-		return nil
-	}
-
-	var paths []v1beta1.HTTPIngressPath
-	for _, service := range services {
-		path := v1beta1.HTTPIngressPath{
-			Path: "/",
-			Backend: v1beta1.IngressBackend{
-				ServiceName: service.Name,
-				ServicePort: intstr.FromInt(8080),
+		rule.HTTP.Paths = []v1beta1.HTTPIngressPath{
+			{
+				Path: "/",
+				Backend: v1beta1.IngressBackend{
+					ServiceName: "temporary-placeholder",
+					ServicePort: intstr.FromInt(8080),
+				},
 			},
 		}
+	} else {
+		var paths []v1beta1.HTTPIngressPath
+		for _, service := range services {
+			path := v1beta1.HTTPIngressPath{
+				Path: "/",
+				Backend: v1beta1.IngressBackend{
+					ServiceName: service.Name,
+					ServicePort: intstr.FromInt(8080),
+				},
+			}
 
-		paths = append(paths, path)
+			paths = append(paths, path)
+		}
+
+		rule.HTTP.Paths = paths
 	}
-
-	rule.HTTP.Paths = paths
 
 	if reflect.DeepEqual(original.Spec, ingress.Spec) && reflect.DeepEqual(original.Annotations, ingress.Annotations) {
 		c.log("No changes for routing ingress %s", key)
@@ -172,7 +167,25 @@ func (c *routingIngressController) processIngress(key string) error {
 
 	c.log("Trying to update ingress %s to %#v", key, ingress)
 
-	_, err = c.routingIngressClient.Ingresses(ns).Update(ingress)
+	oldData, err := json.Marshal(original)
+	if err != nil {
+		c.log("Error converting original to json: %v", err)
+		return nil
+	}
+
+	newData, err := json.Marshal(ingress)
+	if err != nil {
+		c.log("Error converting updated to json: %v", err)
+		return nil
+	}
+
+	patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
+	if err != nil {
+		c.log("Error creating patch: %v", err)
+		return nil
+	}
+
+	_, err = c.routingIngressClient.Ingresses(ns).Patch(ingress.Name, types.MergePatchType, patchBytes)
 
 	return err
 }
