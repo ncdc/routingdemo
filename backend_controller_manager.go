@@ -24,6 +24,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	extensionsinformers "k8s.io/client-go/informers/extensions/v1beta1"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -69,6 +71,7 @@ func newBackendIngressControllerManager(
 		cancels:                   make(map[string]func()),
 	}
 	m.syncHandler = m.processSecret
+	m.startHandler = m.onStart
 
 	secretsInformer.Informer().AddEventHandler(
 		cache.FilteringResourceEventHandler{
@@ -87,6 +90,35 @@ func newBackendIngressControllerManager(
 	return m
 }
 
+func (m *backendIngressControllerManager) onStart() {
+	m.log("onStart begin")
+	defer m.log("onStart end")
+
+	backendSelector, err := labels.Parse(backendLabel)
+	if err != nil {
+		m.log("error parsing selector: %v", err)
+		return
+	}
+	services, err := m.routingServiceLister.List(backendSelector)
+	if err != nil {
+		m.log("error listing services: %v", err)
+		return
+	}
+
+	m.log("Found %d backend services", len(services))
+
+	backendNames := sets.NewString()
+	for _, service := range services {
+		backendNames.Insert(service.Labels[backendLabel])
+	}
+
+	for _, name := range backendNames.List() {
+		key := "routing/" + name
+		m.log("onStart enqueuing %s", key)
+		m.queue.Add(key)
+	}
+}
+
 func (m *backendIngressControllerManager) processSecret(key string) error {
 	m.log("backendIngressControllerManager.processSecret start for %s", key)
 	defer m.log("backendIngressControllerManager.processSecret end %s", key)
@@ -102,6 +134,22 @@ func (m *backendIngressControllerManager) processSecret(key string) error {
 		m.log("Couldn't find %s/%s - stopping backend ingress controller for it", ns, name)
 		m.log("canceling backendIngressController %s", name)
 		cancel := m.cancels[name]
+		if cancel == nil {
+			m.log("No backendIngressController running for %s/%s, deleting associated services", ns, name)
+			services, err := m.routingServiceLister.List(labels.SelectorFromSet(labels.Set{backendLabel: name}))
+			if err != nil {
+				m.log("onStop error listing services: %v", err)
+			} else {
+				for _, service := range services {
+					m.log("deleting service %s/%s", service.Namespace, service.Name)
+					if err = m.routingServiceClient.Services(service.Namespace).Delete(service.Name, nil); err != nil {
+						m.log("onStop error deleting service %s/%s: %v", service.Namespace, service.Name, err)
+					}
+				}
+			}
+			return nil
+		}
+
 		cancel()
 
 		m.log("removing backendIngressController %s", name)

@@ -38,6 +38,7 @@ type genericController struct {
 	resyncPeriod         time.Duration
 	cacheSyncWaiters     []cache.InformerSynced
 	additionalGoroutines []func(done <-chan struct{})
+	startHandler         func()
 	stopHandler          func()
 }
 
@@ -111,6 +112,10 @@ func (c *genericController) Run(ctx context.Context, numWorkers int) error {
 
 	for i := range c.additionalGoroutines {
 		go c.additionalGoroutines[i](ctx.Done())
+	}
+
+	if c.startHandler != nil {
+		c.startHandler()
 	}
 
 	<-ctx.Done()
